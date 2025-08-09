@@ -1,4 +1,4 @@
-// main.ts - Deno Deploy Edge Network Proxy with Message Audit and WxPusher
+// main.ts - Deno Deploy Edge Network Proxy with Message Audit, WxPusher and Encryption
 
 interface ApiSite {
   path: string;
@@ -33,10 +33,13 @@ interface BanRecord {
   bannedUntil?: number;
 }
 
+// Encryption configuration
+const ENCRYPTION_PASSWORD = Deno.env.get("ENCRYPTION_PASSWORD") || "openai-proxy-secret-key";
+
 // WxPusher configuration from environment
 const WXPUSHER_API_URL = Deno.env.get("WXPUSHER_API_URL") || "https://wxpusher.zjiecode.com/api/send/message";
-const WXPUSHER_APP_TOKEN = Deno.env.get("WXPUSHER_APP_TOKEN") || "AT_xxx"; // 需要设置实际的token
-const WXPUSHER_UID = Deno.env.get("WXPUSHER_UID") || "UID_xxx"; // 需要设置实际的UID
+const WXPUSHER_APP_TOKEN = Deno.env.get("WXPUSHER_APP_TOKEN") || "AT_xxx";
+const WXPUSHER_UID = Deno.env.get("WXPUSHER_UID") || "UID_xxx";
 
 // Default API sites configuration
 const DEFAULT_API_SITES: ApiSite[] = [
@@ -59,10 +62,390 @@ const DEFAULT_RATE_LIMIT = 120;
 const DEFAULT_AUDIT_PATH = "/v1/chat/completions";
 const DEFAULT_AUDIT_PARAMETER = "messages";
 const DEFAULT_MAX_AUDIT_NUM = 12;
-const DEFAULT_BAN_TIME_INTERVAL = 60; // minutes
-const DEFAULT_BAN_TIME_DURATION = 60; // minutes
-const RATE_LIMIT_WINDOW = 60000; // 1 minute in milliseconds
+const DEFAULT_BAN_TIME_INTERVAL = 60;
+const DEFAULT_BAN_TIME_DURATION = 60;
+const RATE_LIMIT_WINDOW = 60000;
 const AUDIT_API_BASE = "https://apiv1.iminbk.com";
+
+// Encryption/Decryption functions
+async function deriveKey(password: string): Promise<CryptoKey> {
+  const encoder = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+  
+  return await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: encoder.encode("openai-proxy-salt"),
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encrypt(text: string, password: string): Promise<string> {
+  try {
+    const key = await deriveKey(password);
+    const encoder = new TextEncoder();
+    const data = encoder.encode(text);
+    
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encryptedData = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      data
+    );
+    
+    const combined = new Uint8Array(iv.length + encryptedData.byteLength);
+    combined.set(iv);
+    combined.set(new Uint8Array(encryptedData), iv.length);
+    
+    return btoa(String.fromCharCode(...combined));
+  } catch (e) {
+    console.error("Encryption error:", e);
+    throw new Error("Encryption failed");
+  }
+}
+
+async function decrypt(encryptedText: string, password: string): Promise<string> {
+  try {
+    const key = await deriveKey(password);
+    const combined = Uint8Array.from(atob(encryptedText), c => c.charCodeAt(0));
+    
+    const iv = combined.slice(0, 12);
+    const data = combined.slice(12);
+    
+    const decryptedData = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      key,
+      data
+    );
+    
+    const decoder = new TextDecoder();
+    return decoder.decode(decryptedData);
+  } catch (e) {
+    console.error("Decryption error:", e);
+    throw new Error("Decryption failed");
+  }
+}
+
+// HTML pages for encryption/decryption
+function getDecryptionPage(): string {
+  return `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>解密工具</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            width: 100%;
+            max-width: 500px;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 28px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: 'Courier New', monospace;
+        }
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 8px;
+            word-wrap: break-word;
+            display: none;
+        }
+        #result.success {
+            background: #e8f5e9;
+            border: 1px solid #4caf50;
+            color: #2e7d32;
+        }
+        #result.error {
+            background: #ffebee;
+            border: 1px solid #f44336;
+            color: #c62828;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔓 解密工具</h1>
+        <div class="form-group">
+            <label for="ciphertext">密文</label>
+            <textarea id="ciphertext" placeholder="请输入需要解密的密文..."></textarea>
+        </div>
+        <div class="form-group">
+            <label for="password">密码</label>
+            <input type="password" id="password" placeholder="请输入解密密码">
+        </div>
+        <button onclick="handleDecrypt()">解密</button>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        async function handleDecrypt() {
+            const ciphertext = document.getElementById('ciphertext').value.trim();
+            const password = document.getElementById('password').value;
+            const resultDiv = document.getElementById('result');
+            
+            if (!ciphertext || !password) {
+                resultDiv.className = 'error';
+                resultDiv.textContent = '请输入密文和密码';
+                resultDiv.style.display = 'block';
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/decryption', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ciphertext, password })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.className = 'success';
+                    resultDiv.innerHTML = '<strong>解密成功：</strong><br>' + data.plaintext;
+                } else {
+                    resultDiv.className = 'error';
+                    resultDiv.textContent = data.error || '解密失败';
+                }
+                resultDiv.style.display = 'block';
+            } catch (e) {
+                resultDiv.className = 'error';
+                resultDiv.textContent = '请求失败：' + e.message;
+                resultDiv.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
+  `;
+}
+
+function getEncryptionPage(): string {
+  return `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>加密工具</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            width: 100%;
+            max-width: 500px;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 28px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+        input, textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        input:focus, textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: 'Courier New', monospace;
+        }
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        button:hover {
+            transform: translateY(-2px);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 8px;
+            word-wrap: break-word;
+            display: none;
+        }
+        #result.success {
+            background: #e8f5e9;
+            border: 1px solid #4caf50;
+            color: #2e7d32;
+        }
+        #result.error {
+            background: #ffebee;
+            border: 1px solid #f44336;
+            color: #c62828;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔒 加密工具</h1>
+        <div class="form-group">
+            <label for="plaintext">明文</label>
+            <textarea id="plaintext" placeholder="请输入需要加密的明文..."></textarea>
+        </div>
+        <div class="form-group">
+            <label for="password">密码</label>
+            <input type="password" id="password" placeholder="请输入加密密码">
+        </div>
+        <button onclick="handleEncrypt()">加密</button>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        async function handleEncrypt() {
+            const plaintext = document.getElementById('plaintext').value.trim();
+            const password = document.getElementById('password').value;
+            const resultDiv = document.getElementById('result');
+            
+            if (!plaintext || !password) {
+                resultDiv.className = 'error';
+                resultDiv.textContent = '请输入明文和密码';
+                resultDiv.style.display = 'block';
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/encryption', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ plaintext, password })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.className = 'success';
+                    resultDiv.innerHTML = '<strong>加密成功：</strong><br>' + data.ciphertext;
+                } else {
+                    resultDiv.className = 'error';
+                    resultDiv.textContent = data.error || '加密失败';
+                }
+                resultDiv.style.display = 'block';
+            } catch (e) {
+                resultDiv.className = 'error';
+                resultDiv.textContent = '请求失败：' + e.message;
+                resultDiv.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
+  `;
+}
 
 // Get API sites configuration from environment or use default
 function getApiSites(): ApiSite[] {
@@ -95,7 +478,6 @@ function createMockResponse(stream: boolean, model: string): Response {
   const responseContent = "Hello, how can I help you today?";
   
   if (stream) {
-    // Create streaming response
     const encoder = new TextEncoder();
     const streamData = [
       `data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n`,
@@ -121,7 +503,6 @@ function createMockResponse(stream: boolean, model: string): Response {
       }
     });
   } else {
-    // Non-streaming response
     const response = {
       id: "chatcmpl-test",
       object: "chat.completion",
@@ -166,7 +547,7 @@ function formatMessagesForHtml(body: any, auditParameter: string): string {
   }
 }
 
-// Send WxPusher notification
+// Send WxPusher notification with encrypted sensitive data
 async function sendWxPusherNotification(
   apiUrl: string,
   token: string,
@@ -176,21 +557,27 @@ async function sendWxPusherNotification(
   baseurl: string
 ): Promise<void> {
   try {
+    // Encrypt sensitive data
+    const encryptedToken = token ? await encrypt(token, ENCRYPTION_PASSWORD) : "";
+    const encryptedMessages = await encrypt(formattedMessages, ENCRYPTION_PASSWORD);
+    
     // Prepare summary (max 20 chars)
-    let summary = `站点：${baseurl}触发审核告警`;
+    let summary = `站点触发审核拦截告警`;
     if (summary.length > 20) {
       summary = summary.substring(0, 20);
     }
     
-    // Prepare content, if need protect token: ${token ? token.substring(0, 10) + "..." : "无"}
+    // Prepare content with encrypted data
     const content = `
-      <h2 style="color:red;">触发道德审查</h2>
+      <h2 style="color:red;">API站点触发审核拦截</h2>
       <p><strong>API地址：</strong>${apiUrl}</p>
-      <p><strong>令牌：</strong>${token ? token : "无"}</p>
+      <p><strong>令牌（已加密）：</strong><code style="word-break:break-all;">${encryptedToken || "无"}</code></p>
       <p><strong>模型：</strong>${model || "未指定"}</p>
       <p><strong>审核结果：</strong>${auditResult.data?.descr || "违规内容"}</p>
-      <h3>违规内容：</h3>
-      ${formattedMessages}
+      <h3>违规内容（已加密）：</h3>
+      <p><code style="word-break:break-all;">${encryptedMessages}</code></p>
+      <hr>
+      <p style="color:#666;font-size:12px;">使用解密工具查看原文：/decryption</p>
     `;
     
     const payload = {
@@ -302,7 +689,6 @@ async function checkAndUpdateBanStatus(
         await kv.delete(entry.key);
       } else if (!record.bannedUntil && 
                  now - record.firstViolationTime > banTimeInterval * 60 * 1000) {
-        // Reset count if interval has passed
         await kv.delete(entry.key);
       }
     }
@@ -312,36 +698,30 @@ async function checkAndUpdateBanStatus(
     let record = entry.value;
     
     if (record) {
-      // Check if currently banned
       if (record.bannedUntil && record.bannedUntil > now) {
         return { isBanned: true, violationCount: record.count };
       }
       
-      // Check if we need to reset the count (interval passed)
       if (now - record.firstViolationTime > banTimeInterval * 60 * 1000) {
         record = null;
       }
     }
     
     if (!record) {
-      // Create new record
       record = {
         count: 1,
         firstViolationTime: now
       };
     } else {
-      // Increment count
       record.count++;
     }
     
-    // Check if should ban
     if (record.count >= maxAuditNum) {
       record.bannedUntil = now + (banTimeDuration * 60 * 1000);
       await kv.set(banKey, record);
       return { isBanned: true, violationCount: record.count };
     }
     
-    // Update record
     await kv.set(banKey, record);
     return { isBanned: false, violationCount: record.count };
     
@@ -442,6 +822,7 @@ async function forwardRequest(request: Request, targetUrl: string): Promise<Resp
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   
+  // Root endpoint
   if (url.pathname === "/" && request.method === "GET") {
     return new Response(JSON.stringify({
       status: "ok",
@@ -451,6 +832,85 @@ async function handleRequest(request: Request): Promise<Response> {
     });
   }
   
+  // Decryption page
+  if (url.pathname === "/decryption" && request.method === "GET") {
+    return new Response(getDecryptionPage(), {
+      headers: { "Content-Type": "text/html; charset=utf-8" }
+    });
+  }
+  
+  // Encryption page
+  if (url.pathname === "/encryption" && request.method === "GET") {
+    return new Response(getEncryptionPage(), {
+      headers: { "Content-Type": "text/html; charset=utf-8" }
+    });
+  }
+  
+  // Decryption API
+  if (url.pathname === "/api/decryption" && request.method === "POST") {
+    try {
+      const body = await request.json();
+      const { ciphertext, password } = body;
+      
+      if (!ciphertext || !password) {
+        return new Response(JSON.stringify({ error: "密文和密码不能为空" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      
+      if (password !== ENCRYPTION_PASSWORD) {
+        return new Response(JSON.stringify({ error: "密码错误，解密失败" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      
+      const plaintext = await decrypt(ciphertext, ENCRYPTION_PASSWORD);
+      return new Response(JSON.stringify({ plaintext }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: "解密失败：" + e.message }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }
+  
+  // Encryption API
+  if (url.pathname === "/api/encryption" && request.method === "POST") {
+    try {
+      const body = await request.json();
+      const { plaintext, password } = body;
+      
+      if (!plaintext || !password) {
+        return new Response(JSON.stringify({ error: "明文和密码不能为空" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      
+      if (password !== ENCRYPTION_PASSWORD) {
+        return new Response(JSON.stringify({ error: "密码错误，无权限进行加密" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      
+      const ciphertext = await encrypt(plaintext, ENCRYPTION_PASSWORD);
+      return new Response(JSON.stringify({ ciphertext }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: "加密失败：" + e.message }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }
+  
+  // Proxy endpoints
   if (!url.pathname.startsWith("/proxy/")) {
     return createErrorResponse(404, "Not found");
   }
@@ -545,7 +1005,7 @@ async function handleRequest(request: Request): Promise<Response> {
               banTimeDuration
             );
             
-            // Send WxPusher notification
+            // Send WxPusher notification with encrypted data
             const formattedMessages = formatMessagesForHtml(body, auditParameter);
             await sendWxPusherNotification(
               targetUrl,
