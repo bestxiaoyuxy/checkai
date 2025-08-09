@@ -1,9 +1,12 @@
-// main.ts - Deno Deploy Edge Network Proxy with Message Audit
+// main.ts - Deno Deploy Edge Network Proxy with Message Audit and WxPusher
 
 interface ApiSite {
   path: string;
   baseurl: string;
   ratelimit?: number;
+  MaxAuditNum?: number;
+  BanTimeInterval?: number;
+  BanTimeDuration?: number;
   "msg-audit-config"?: {
     AuditPath?: string;
     AuditParameter?: string;
@@ -24,12 +27,26 @@ interface AuditResponse {
   };
 }
 
+interface BanRecord {
+  count: number;
+  firstViolationTime: number;
+  bannedUntil?: number;
+}
+
+// WxPusher configuration from environment
+const WXPUSHER_API_URL = Deno.env.get("WXPUSHER_API_URL") || "https://wxpusher.zjiecode.com/api/send/message";
+const WXPUSHER_APP_TOKEN = Deno.env.get("WXPUSHER_APP_TOKEN") || "AT_xxx"; // 需要设置实际的token
+const WXPUSHER_UID = Deno.env.get("WXPUSHER_UID") || "UID_xxx"; // 需要设置实际的UID
+
 // Default API sites configuration
 const DEFAULT_API_SITES: ApiSite[] = [
   {
     path: "openai",
     baseurl: "https://api.openai.com",
     ratelimit: 0,
+    MaxAuditNum: 12,
+    BanTimeInterval: 60,
+    BanTimeDuration: 60,
     "msg-audit-config": {
       AuditPath: "/v1/chat/completions",
       AuditParameter: "messages"
@@ -41,6 +58,9 @@ const DEFAULT_API_SITES: ApiSite[] = [
 const DEFAULT_RATE_LIMIT = 120;
 const DEFAULT_AUDIT_PATH = "/v1/chat/completions";
 const DEFAULT_AUDIT_PARAMETER = "messages";
+const DEFAULT_MAX_AUDIT_NUM = 12;
+const DEFAULT_BAN_TIME_INTERVAL = 60; // minutes
+const DEFAULT_BAN_TIME_DURATION = 60; // minutes
 const RATE_LIMIT_WINDOW = 60000; // 1 minute in milliseconds
 const AUDIT_API_BASE = "https://apiv1.iminbk.com";
 
@@ -57,22 +77,161 @@ function getApiSites(): ApiSite[] {
   return DEFAULT_API_SITES;
 }
 
+// Check if this is a test request
+function isTestRequest(body: any, auditParameter: string): boolean {
+  try {
+    const messages = body[auditParameter];
+    if (!Array.isArray(messages) || messages.length !== 1) return false;
+    
+    const msg = messages[0];
+    return msg.role === "user" && msg.content === "hi";
+  } catch {
+    return false;
+  }
+}
+
+// Create a mock response for test requests
+function createMockResponse(stream: boolean, model: string): Response {
+  const responseContent = "Hello, how can I help you today?";
+  
+  if (stream) {
+    // Create streaming response
+    const encoder = new TextEncoder();
+    const streamData = [
+      `data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n`,
+      `data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{"content":"${responseContent}"},"finish_reason":null}]}\n\n`,
+      `data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`,
+      `data: [DONE]\n\n`
+    ];
+    
+    const stream = new ReadableStream({
+      start(controller) {
+        for (const chunk of streamData) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        controller.close();
+      }
+    });
+    
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive"
+      }
+    });
+  } else {
+    // Non-streaming response
+    const response = {
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: model,
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: responseContent
+        },
+        finish_reason: "stop"
+      }],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30
+      }
+    };
+    
+    return new Response(JSON.stringify(response), {
+      headers: { "Content-Type": "application/json" }
+    });
+  }
+}
+
+// Format messages for HTML display
+function formatMessagesForHtml(body: any, auditParameter: string): string {
+  try {
+    const messages = body[auditParameter];
+    if (!Array.isArray(messages)) return "";
+    
+    return messages
+      .map((msg: any) => {
+        const role = msg.role || "unknown";
+        const content = msg.content || "";
+        return `<p><strong>${role}:</strong> ${content.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</p>`;
+      })
+      .join("<br/>");
+  } catch {
+    return "";
+  }
+}
+
+// Send WxPusher notification
+async function sendWxPusherNotification(
+  apiUrl: string,
+  token: string,
+  model: string,
+  auditResult: AuditResponse,
+  formattedMessages: string,
+  baseurl: string
+): Promise<void> {
+  try {
+    // Prepare summary (max 20 chars)
+    let summary = `站点：${baseurl}触发审核告警`;
+    if (summary.length > 20) {
+      summary = summary.substring(0, 20);
+    }
+    
+    // Prepare content
+    const content = `
+      <h2 style="color:red;">触发道德审查</h2>
+      <p><strong>API地址：</strong>${apiUrl}</p>
+      <p><strong>令牌：</strong>${token ? token.substring(0, 10) + "..." : "无"}</p>
+      <p><strong>模型：</strong>${model || "未指定"}</p>
+      <p><strong>审核结果：</strong>${auditResult.data?.descr || "违规内容"}</p>
+      <h3>违规内容：</h3>
+      ${formattedMessages}
+    `;
+    
+    const payload = {
+      appToken: WXPUSHER_APP_TOKEN,
+      content: content,
+      summary: summary,
+      contentType: 2,
+      uids: [WXPUSHER_UID],
+      verifyPayType: 0
+    };
+    
+    const response = await fetch(WXPUSHER_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    
+    if (!response.ok) {
+      console.error("WxPusher notification failed:", await response.text());
+    }
+  } catch (e) {
+    console.error("Error sending WxPusher notification:", e);
+  }
+}
+
 // Extract and format messages for audit
 function extractMessagesForAudit(body: any, auditParameter: string): string {
   try {
     const messages = body[auditParameter];
     if (!Array.isArray(messages)) return "";
     
-    // Format messages: role:content pairs
     const formatted = messages
       .map((msg: any) => {
         if (typeof msg.content === "string") {
-          // Filter out excessive non-text symbols and trim
           const cleaned = msg.content
             .replace(/[\n\r\t]+/g, " ")
             .replace(/\s+/g, " ")
             .trim()
-            .slice(0, 500); // Limit length for audit
+            .slice(0, 500);
           return `${msg.role}:${cleaned}`;
         }
         return "";
@@ -90,16 +249,12 @@ function extractMessagesForAudit(body: any, auditParameter: string): string {
 // Perform message audit
 async function auditMessage(message: string): Promise<AuditResponse | null> {
   try {
-    // Decide whether to use base64 or URL encoding based on content
     let auditUrl: string;
     
-    // Check if message contains special characters that might break URL
     if (/[^\x00-\x7F]/.test(message) || message.length > 200) {
-      // Use base64 for non-ASCII or long messages
       const base64Message = btoa(unescape(encodeURIComponent(message)));
       auditUrl = `${AUDIT_API_BASE}/base64?word=${base64Message}`;
     } else {
-      // Use URL encoding for simple messages
       auditUrl = `${AUDIT_API_BASE}/?word=${encodeURIComponent(message)}`;
     }
     
@@ -122,16 +277,107 @@ async function auditMessage(message: string): Promise<AuditResponse | null> {
   }
 }
 
+// Check and update ban status
+async function checkAndUpdateBanStatus(
+  baseurl: string,
+  token: string,
+  maxAuditNum: number,
+  banTimeInterval: number,
+  banTimeDuration: number
+): Promise<{ isBanned: boolean; violationCount: number }> {
+  if (maxAuditNum === 0) {
+    return { isBanned: false, violationCount: 0 };
+  }
+  
+  const kv = await Deno.openKv();
+  const now = Date.now();
+  const banKey = ["ban", baseurl, token];
+  
+  try {
+    // Clean up expired ban records
+    const iter = kv.list({ prefix: ["ban"] });
+    for await (const entry of iter) {
+      const record = entry.value as BanRecord;
+      if (record.bannedUntil && record.bannedUntil < now) {
+        await kv.delete(entry.key);
+      } else if (!record.bannedUntil && 
+                 now - record.firstViolationTime > banTimeInterval * 60 * 1000) {
+        // Reset count if interval has passed
+        await kv.delete(entry.key);
+      }
+    }
+    
+    // Get current ban record
+    const entry = await kv.get<BanRecord>(banKey);
+    let record = entry.value;
+    
+    if (record) {
+      // Check if currently banned
+      if (record.bannedUntil && record.bannedUntil > now) {
+        return { isBanned: true, violationCount: record.count };
+      }
+      
+      // Check if we need to reset the count (interval passed)
+      if (now - record.firstViolationTime > banTimeInterval * 60 * 1000) {
+        record = null;
+      }
+    }
+    
+    if (!record) {
+      // Create new record
+      record = {
+        count: 1,
+        firstViolationTime: now
+      };
+    } else {
+      // Increment count
+      record.count++;
+    }
+    
+    // Check if should ban
+    if (record.count >= maxAuditNum) {
+      record.bannedUntil = now + (banTimeDuration * 60 * 1000);
+      await kv.set(banKey, record);
+      return { isBanned: true, violationCount: record.count };
+    }
+    
+    // Update record
+    await kv.set(banKey, record);
+    return { isBanned: false, violationCount: record.count };
+    
+  } catch (e) {
+    console.error("Ban status check error:", e);
+    return { isBanned: false, violationCount: 0 };
+  }
+}
+
+// Check if token is currently banned
+async function isTokenBanned(baseurl: string, token: string): Promise<{ banned: boolean; remainingMinutes?: number }> {
+  const kv = await Deno.openKv();
+  const now = Date.now();
+  const banKey = ["ban", baseurl, token];
+  
+  try {
+    const entry = await kv.get<BanRecord>(banKey);
+    if (entry.value && entry.value.bannedUntil && entry.value.bannedUntil > now) {
+      const remainingMinutes = Math.ceil((entry.value.bannedUntil - now) / 60000);
+      return { banned: true, remainingMinutes };
+    }
+    return { banned: false };
+  } catch {
+    return { banned: false };
+  }
+}
+
 // Rate limiting using Deno KV
 async function checkRateLimit(baseurl: string, limit: number): Promise<boolean> {
-  if (limit === 0) return true; // No limit
+  if (limit === 0) return true;
   
   const kv = await Deno.openKv();
   const now = Date.now();
   const key = ["ratelimit", baseurl];
   
   try {
-    // Clean up expired entries
     const expireKey = ["ratelimit_expire", baseurl];
     const expireEntry = await kv.get<number>(expireKey);
     if (expireEntry.value && expireEntry.value < now) {
@@ -139,15 +385,13 @@ async function checkRateLimit(baseurl: string, limit: number): Promise<boolean> 
       await kv.delete(expireKey);
     }
     
-    // Get current count
     const entry = await kv.get<number>(key);
     const currentCount = entry.value || 0;
     
     if (currentCount >= limit) {
-      return false; // Rate limit exceeded
+      return false;
     }
     
-    // Increment count
     await kv.atomic()
       .set(key, currentCount + 1)
       .set(["ratelimit_expire", baseurl], now + RATE_LIMIT_WINDOW)
@@ -156,7 +400,7 @@ async function checkRateLimit(baseurl: string, limit: number): Promise<boolean> 
     return true;
   } catch (e) {
     console.error("Rate limit check error:", e);
-    return true; // Allow on error
+    return true;
   }
 }
 
@@ -183,8 +427,6 @@ function createErrorResponse(status: number, message: string, type?: string, par
 // Forward request to target
 async function forwardRequest(request: Request, targetUrl: string): Promise<Response> {
   const headers = new Headers(request.headers);
-  
-  // Remove host header to avoid conflicts
   headers.delete("host");
   
   const forwardReq = new Request(targetUrl, {
@@ -200,7 +442,6 @@ async function forwardRequest(request: Request, targetUrl: string): Promise<Resp
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
   
-  // Handle root path
   if (url.pathname === "/" && request.method === "GET") {
     return new Response(JSON.stringify({
       status: "ok",
@@ -210,23 +451,22 @@ async function handleRequest(request: Request): Promise<Response> {
     });
   }
   
-  // Check if this is a proxy request
   if (!url.pathname.startsWith("/proxy/")) {
     return createErrorResponse(404, "Not found");
   }
   
-  // Extract proxy path
-  const proxyPath = url.pathname.substring(7); // Remove "/proxy/"
+  const proxyPath = url.pathname.substring(7);
   
   let baseurl: string;
   let targetPath: string;
   let rateLimit: number = DEFAULT_RATE_LIMIT;
   let auditPath: string = DEFAULT_AUDIT_PATH;
   let auditParameter: string = DEFAULT_AUDIT_PARAMETER;
+  let maxAuditNum: number = DEFAULT_MAX_AUDIT_NUM;
+  let banTimeInterval: number = DEFAULT_BAN_TIME_INTERVAL;
+  let banTimeDuration: number = DEFAULT_BAN_TIME_DURATION;
   
-  // Check if it's a direct URL proxy
   if (proxyPath.startsWith("http://") || proxyPath.startsWith("https://")) {
-    // Direct URL proxy: /proxy/https://api.example.com/paths
     const urlMatch = proxyPath.match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
     if (!urlMatch) {
       return createErrorResponse(400, "Invalid proxy URL");
@@ -234,14 +474,11 @@ async function handleRequest(request: Request): Promise<Response> {
     
     baseurl = urlMatch[1];
     targetPath = urlMatch[2] || "/";
-    // Use default rate limit for direct proxies
   } else {
-    // Path-based proxy: /proxy/openai/paths
     const pathParts = proxyPath.split("/");
     const sitePath = pathParts[0];
     targetPath = "/" + pathParts.slice(1).join("/");
     
-    // Find matching API site
     const apiSites = getApiSites();
     const site = apiSites.find(s => s.path === sitePath);
     
@@ -251,6 +488,9 @@ async function handleRequest(request: Request): Promise<Response> {
     
     baseurl = site.baseurl;
     rateLimit = site.ratelimit ?? DEFAULT_RATE_LIMIT;
+    maxAuditNum = site.MaxAuditNum ?? DEFAULT_MAX_AUDIT_NUM;
+    banTimeInterval = site.BanTimeInterval ?? DEFAULT_BAN_TIME_INTERVAL;
+    banTimeDuration = site.BanTimeDuration ?? DEFAULT_BAN_TIME_DURATION;
     
     if (site["msg-audit-config"]) {
       auditPath = site["msg-audit-config"].AuditPath || DEFAULT_AUDIT_PATH;
@@ -258,53 +498,85 @@ async function handleRequest(request: Request): Promise<Response> {
     }
   }
   
-  // Check rate limit
+  // Extract token from Authorization header
+  const authHeader = request.headers.get("Authorization");
+  const token = authHeader ? authHeader.replace("Bearer ", "") : "";
+  
+  // Check if token is banned
+  const banStatus = await isTokenBanned(baseurl, token);
+  if (banStatus.banned) {
+    return createErrorResponse(
+      403,
+      `因在${banTimeInterval}分钟内触发${maxAuditNum}次违规，已暂时被封禁${banTimeDuration}分钟，请稍后再试。剩余封禁时间：${banStatus.remainingMinutes}分钟`,
+      "access_denied"
+    );
+  }
+  
   const rateLimitOk = await checkRateLimit(baseurl, rateLimit);
   if (!rateLimitOk) {
     return createErrorResponse(429, "Rate limit exceeded. Please try again later.", "rate_limit_error");
   }
   
-  // Build target URL
   const targetUrl = baseurl + targetPath;
   
-  // Check if this is a chat completion request that needs audit
   if (targetPath === auditPath && request.method === "POST") {
     try {
-      // Clone request to read body
       const bodyText = await request.text();
       const body = JSON.parse(bodyText);
       
-      // Extract messages for audit
+      // Check if this is a test request
+      if (isTestRequest(body, auditParameter)) {
+        return createMockResponse(body.stream === true, body.model ? body.model : "model");
+      }
+      
       const messagesToAudit = extractMessagesForAudit(body, auditParameter);
       
       if (messagesToAudit) {
-        // Perform audit
         const auditResult = await auditMessage(messagesToAudit);
         
         if (auditResult) {
-          if (auditResult.status === "done") {
-            if (auditResult.verdict === "malicious") {
-              // Block malicious content
+          if (auditResult.status === "done" && auditResult.verdict === "malicious") {
+            // Update ban status
+            const { isBanned, violationCount } = await checkAndUpdateBanStatus(
+              baseurl,
+              token,
+              maxAuditNum,
+              banTimeInterval,
+              banTimeDuration
+            );
+            
+            // Send WxPusher notification
+            const formattedMessages = formatMessagesForHtml(body, auditParameter);
+            await sendWxPusherNotification(
+              targetUrl,
+              token,
+              body.model,
+              auditResult,
+              formattedMessages,
+              baseurl
+            );
+            
+            if (isBanned) {
               return createErrorResponse(
                 403,
-                auditResult.data?.descr || "Content blocked by security policy",
+                `因在${banTimeInterval}分钟内触发${maxAuditNum}次违规，已暂时被封禁${banTimeDuration}分钟，请稍后再试。`,
+                "access_denied"
+              );
+            } else {
+              return createErrorResponse(
+                403,
+                `${auditResult.data?.descr || "Content blocked by security policy"}。当前违规次数：${violationCount}/${maxAuditNum}`,
                 auditResult.verdict,
                 auditResult.data?.match_string,
                 auditResult.rule_id
               );
             }
-            // verdict === "security", allow request
-          } else {
-            // Audit failed, log and allow (fail open)
-            console.error("Audit API returned non-done status:", auditResult);
           }
         } else {
-          // Audit API error, log and allow (fail open)
           console.error("Audit API failed, allowing request");
         }
       }
       
-      // Forward request with original body
       const forwardReq = new Request(targetUrl, {
         method: request.method,
         headers: request.headers,
@@ -318,7 +590,6 @@ async function handleRequest(request: Request): Promise<Response> {
     }
   }
   
-  // For non-chat requests, forward directly
   return await forwardRequest(request, targetUrl);
 }
 
