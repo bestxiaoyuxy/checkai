@@ -182,11 +182,11 @@ async function sendWxPusherNotification(
       summary = summary.substring(0, 20);
     }
     
-    // Prepare content
+    // Prepare content, if need protect token: ${token ? token.substring(0, 10) + "..." : "无"}
     const content = `
       <h2 style="color:red;">触发道德审查</h2>
       <p><strong>API地址：</strong>${apiUrl}</p>
-      <p><strong>令牌：</strong>${token ? token.substring(0, 10) + "..." : "无"}</p>
+      <p><strong>令牌：</strong>${token ? token : "无"}</p>
       <p><strong>模型：</strong>${model || "未指定"}</p>
       <p><strong>审核结果：</strong>${auditResult.data?.descr || "违规内容"}</p>
       <h3>违规内容：</h3>
